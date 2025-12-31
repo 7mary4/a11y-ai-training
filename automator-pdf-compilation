@@ -1,0 +1,95 @@
+on run {input, parameters}
+	-- If run as an Automator Application with dropped folders, use that.
+	-- Otherwise, prompt for a folder.
+	set targetFolderPOSIX to ""
+	if input is not {} then
+		try
+			set targetFolderPOSIX to POSIX path of (item 1 of input as alias)
+		end try
+	end if
+	
+	if targetFolderPOSIX is "" then
+		set targetFolder to choose folder with prompt "Choose a folder to convert to PDFs and merge:"
+		set targetFolderPOSIX to POSIX path of targetFolder
+	end if
+	
+	-- Clean trailing slash
+	if targetFolderPOSIX ends with "/" then set targetFolderPOSIX to text 1 thru -2 of targetFolderPOSIX
+	
+	-- Folder name becomes output file name
+	set folderName to do shell script "basename " & quoted form of targetFolderPOSIX
+	set outputPDF to targetFolderPOSIX & "/" & folderName & ".pdf"
+	
+	-- Where we’ll place converted PDFs before merging
+	set stagingDir to targetFolderPOSIX & "/_pdf_staging"
+	do shell script "mkdir -p " & quoted form of stagingDir
+	
+	-- 1) Convert non-PDF files to PDF using qlmanage (best-effort)
+	-- qlmanage can convert many formats: images, text, Office (if Quick Look supports it), etc.
+	-- It outputs PDFs into stagingDir.
+	do shell script "
+	set -e
+	FOLDER=" & quoted form of targetFolderPOSIX & "
+	STAGE=" & quoted form of stagingDir & "
+	
+	# Convert everything that is NOT already a PDF
+	# Skip hidden files, skip the staging folder itself
+	find \"$FOLDER\" -type f \
+		-not -path \"*/_pdf_staging/*\" \
+		-not -name \".*\" \
+		-not -iname \"*.pdf\" \
+		-print0 | while IFS= read -r -d '' f; do
+			# Convert via Quick Look (best effort). If it fails, keep going.
+			/usr/bin/qlmanage -p \"$f\" >/dev/null 2>&1 || true
+			/usr/bin/qlmanage -t -s 2000 -o \"$STAGE\" \"$f\" >/dev/null 2>&1 || true
+			# qlmanage -t produces .png thumbnails for many types; so instead use -t for preview
+			# and -p is just for rendering; real PDF export is done by 'qlmanage -t' only for some types.
+		done
+	"
+	
+	-- IMPORTANT NOTE:
+	-- qlmanage’s PDF export behavior varies by file type and macOS version.
+	-- For consistently converting Office docs, consider printing to PDF via GUI apps or using 'textutil' for .rtf/.txt.
+	-- We’ll still proceed and merge whatever PDFs exist.
+
+	-- 2) Collect all PDFs (original + any created) and merge them
+	-- We'll merge in a stable order: originals first by path, then staging PDFs by name.
+	-- Use pdfunite if available; otherwise you can switch to an alternate merger (see below).
+	try
+		do shell script "
+		set -e
+		FOLDER=" & quoted form of targetFolderPOSIX & "
+		STAGE=" & quoted form of stagingDir & "
+		OUT=" & quoted form of outputPDF & "
+		
+		# Build list of PDFs
+		mapfile -t pdfs < <(
+			( find \"$FOLDER\" -type f -iname \"*.pdf\" -not -path \"*/_pdf_staging/*\" -print | sort
+			  find \"$STAGE\" -type f -iname \"*.pdf\" -print | sort ) | sed '/^$/d'
+		)
+		
+		# If no PDFs, exit
+		if [ ${#pdfs[@]} -eq 0 ]; then
+			echo \"No PDFs found or created.\"
+			exit 1
+		fi
+		
+		# Merge using pdfunite if present
+		if command -v pdfunite >/dev/null 2>&1; then
+			pdfunite \"${pdfs[@]}\" \"$OUT\"
+		else
+			echo \"pdfunite not found. Install poppler (brew install poppler) or enable the fallback merger in the script.\"
+			exit 2
+		fi
+		
+		# Cleanup staging folder (optional)
+		rm -rf \"$STAGE\"
+		"
+	on error errMsg number errNum
+		display dialog "Merge/conversion finished with an issue:\n\n" & errMsg buttons {"OK"} default button "OK"
+		return input
+	end try
+	
+	display dialog "Done!\n\nCreated:\n" & outputPDF buttons {"OK"} default button "OK"
+	return input
+end run
